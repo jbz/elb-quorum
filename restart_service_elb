@@ -1,0 +1,615 @@
+#!/usr/bin/env python
+"""restart_service_elb
+
+Gracefully restart supervisor processes on an instance by first checking
+for quorum in the load balancer, then (if quorum exists) unregistering from
+the ELB, restarting the specified supervisor processes, and then
+reregistering in the ELB.
+
+This script relies on AWS credentials being available to boto, generally
+either in ~/.aws/credentials or another boto-standard location.
+
+NOTE: this script currently assumes the instance is in a single ELB, and
+ignores the case of instances being registered to multiple.  To handle
+that case, we'll need to change the script to handle ELB lists and to test
+for ELB membership differently.
+
+If a file or dir exists at path NO_REGISTER_ELB_PATH, the 'restart' command
+will silently abort (and report why if --debug is given).
+
+Usage:
+    restart_service_elb restart [ -d ] <service_name> [ <elb_name> ]
+    restart_service_elb deregister [ -d ]
+    restart_service_elb register <elb_name> [-d]
+    restart_service_elb count [-d]
+    restart_service_elb [ -h | --help ]
+
+Options:
+    restart             Restart supervisor process <service_name>, ALL or NONE.
+                        If <elb_name> is given, attempts to reregister instance
+                        to that ELB on restart.
+    deregister          Deregister this instance from ELB it is registered in
+    register            Register this instance to ELB <elb_name>
+    count               Check quorum on instances in registered ELB only
+    -d --debug          Show progress info as well as errors.
+    -h --help           Show this screen
+"""
+
+from __future__ import unicode_literals
+from __future__ import division     # Ensures floating point results
+import time
+import boto.ec2.elb
+import boto.utils
+from boto.exception import BotoServerError
+import os.path
+import socket
+import sys
+from docopt import docopt
+from subprocess import check_output
+
+AWS_REGION = 'us-east-1'
+AWS_PROFILE = "elb-control"
+CONNECTION_DRAIN_TIMEOUT = 60   # Seconds to wait for ELB drain before error
+ELB_REGISTER_TIMEOUT = 60    # Secs to wait to go InService with ELB or error
+ELB_CHANGE_ATTEMPTS = 5      # Num of attempts to change ELB state before fail
+INSTANCE_QUORUM = 0.67       # Fraction of instances InService to restart
+MIN_INSTANCES = 1            # Min # of instances InService to restart
+QUORUM_ATTEMPTS = 5          # Num of attempts for quorum before fail
+QUORUM_RETRY_INTERVAL = 5    # Secs to wait between quorum check tries
+BOTO_ATTEMPTS = 10           # Default # of attempts for boto calls before fail
+NO_REGISTER_ELB_PATH = "/tmp/no_register_elb"
+SUPPORTED_DOMAINS = ['example.com']
+DEBUG = False
+SERVICE_NAME = "NONE"
+
+
+def get_my_current_elb(instance_id):
+    """
+    Attempts to determine which ELB the passed instance_id is registered to by
+    first scanning all instances registered to all ELBs.  If that fails (say
+    because the instance is currently unregistered) it tries to guess which
+    it *should* belong to by matching the local host FQDN to the ELB name.
+    This logic needs a bit of work, it assumes prclt.net pretty much because
+    it only checks for a 3-level domain name match, not a 4 like chai/pekoe.
+    Returns guessed ELB boto object or None if it can't figure it out.
+
+    Args:
+        instance_id (str) - the instance id of the local machine
+
+    Returns:
+        boto.ec2.elb.loadbalancer.LoadBalancer or None
+    """
+    assert isinstance(instance_id, str)
+
+    elb_conn = boto.ec2.elb.connect_to_region(
+            profile_name=AWS_PROFILE,
+            region_name=AWS_REGION)
+
+    for attempt in range(BOTO_ATTEMPTS):
+        try:
+            elb_list = elb_conn.get_all_load_balancers()
+            break
+        except BotoServerError as err:
+            if err.status == 400:
+                if attempt == (BOTO_ATTEMPTS - 1):
+                    raise
+                time.sleep(1)
+            else:
+                raise
+
+    for elb in elb_list:
+        for instance in elb.instances:
+            if instance.id == instance_id:
+                return elb
+
+    if DEBUG:
+        print ("Not currently registered to an ELB!")
+
+    return None
+
+
+def get_elb_by_hostname():
+    """
+    Attempts to guess which ELB this host belongs to by pattern matching the
+    last three elements of its fqdn against ELB names:
+    x.y.z -> x-y-z
+
+    Returns:
+        boto.ec2.elb.loadbalancer.LoadBalancer or None
+    """
+    elb_conn = boto.ec2.elb.connect_to_region(
+            profile_name=AWS_PROFILE,
+            region_name=AWS_REGION)
+
+    if DEBUG:
+        print "Getting ELB by hostname..."
+    fqdn = socket.getfqdn()
+    cluster_guess = '-'.join(fqdn.split('.')[-3:])
+    if DEBUG:
+        print "ELB guess is {}".format(cluster_guess)
+
+    for attempt in range(BOTO_ATTEMPTS):
+        try:
+            elb_list = elb_conn.get_all_load_balancers()
+            break
+        except BotoServerError as err:
+            if err.status == 400:
+                if attempt == (BOTO_ATTEMPTS - 1):
+                    raise
+                time.sleep(1)
+            else:
+                raise
+
+    for elb in elb_list:
+        if cluster_guess == elb.name:
+            return elb
+
+    print "Couldn't determine proper ELB!"
+    return None
+
+
+def get_elb_by_name(elb_name):
+    """
+    Given an ELB name string, returns a boto ELB object for the *first* ELB
+    that has that name in the associated AWS account/region.
+
+    Args:
+        elb_name (str)  The name of the ELB to return as an object
+
+    Returns:
+        boto.ec2.elb.loadbalancer.LoadBalancer
+    """
+    assert isinstance(elb_name, basestring)
+
+    elb_conn = boto.ec2.elb.connect_to_region(
+            profile_name=AWS_PROFILE,
+            region_name=AWS_REGION)
+
+    for attempt in range(BOTO_ATTEMPTS):
+        try:
+            elb_list = elb_conn.get_all_load_balancers([elb_name])
+            break
+        except BotoServerError as err:
+            if err.status == 400:
+                if attempt == (BOTO_ATTEMPTS - 1):
+                    raise
+                time.sleep(1)
+            else:
+                raise
+
+    return elb_list[0]
+
+
+def deregister_from_elb(my_instance_id):
+    """
+    Deregisters ec2 instance with id=my_instance_id from the first
+    ELB it finds itself registered to and waits for status to
+    change on EC2 before returning
+
+    Args:
+        my_instance_id (str)    Instance ID to deregister
+
+    Returns:
+        boolean                 True if successful, False on any error
+    """
+    assert isinstance(my_instance_id, str)
+
+    result = None
+
+    live_elb = get_my_current_elb(my_instance_id)
+
+    if live_elb is None:
+        print "Couldn't determine ELB to degregister from!"
+        return False
+
+    if DEBUG:
+        print "Deregistering myself (instance id {}) from ELB {}...".format(
+                my_instance_id,
+                live_elb.name)
+
+    for attempt in range(ELB_CHANGE_ATTEMPTS):
+        try:
+            live_elb.deregister_instances(my_instance_id)
+            break
+        except BotoServerError as err:
+            if err.status == 400:
+                if attempt == (ELB_CHANGE_ATTEMPTS - 1):
+                    raise
+                time.sleep(1)
+
+    start = time.time()
+
+    timeout = time.time() + CONNECTION_DRAIN_TIMEOUT
+    while time.time() < timeout:
+        try:
+            health = live_elb.get_instance_health([my_instance_id])[0]
+            assert health.instance_id == my_instance_id
+            if health.state == 'OutOfService':
+                result = "Success"
+                break
+        except BotoServerError as err:
+            if err.status != 400:
+                raise
+        time.sleep(3)
+
+    if not result:
+        print("Error! Could not remove myself from ELB!")
+        return False
+
+    if DEBUG:
+        print("Instance {} is now removed from ELB {} (took {:0.1f} "
+              "seconds)".format(my_instance_id,
+                                live_elb.name,
+                                time.time() - start))
+    return True
+
+
+def register_to_elb(my_instance_id, elb_name=None):
+    """
+    Registers ec2 instance with id=my_instance_id into instance pool of
+    ELB with name elb_name OR, if none given, the ELB that matches the hostname
+    and waits for (ELB_REGISTER_TIMEOUT) for status to change to InService.
+
+    Args:
+        my_instance_id (str)    Instance ID to register with ELB
+        elb_name (str)          If passed, name of the ELB to register with
+
+    Returns:
+        boolean                 True if registration successful and InService,
+                                False otherwise
+    """
+    assert isinstance(my_instance_id, str)
+    assert (isinstance(elb_name, basestring) or
+            elb_name is None)
+
+    if os.path.exists(NO_REGISTER_ELB_PATH):
+        print ("Skipping ELB registration due to flag "
+               "file at {}".format(NO_REGISTER_ELB_PATH))
+        return True
+
+    if elb_name is None:
+        live_elb = get_elb_by_hostname()
+    else:
+        live_elb = get_elb_by_name(elb_name)
+
+    assert isinstance(live_elb, boto.ec2.elb.loadbalancer.LoadBalancer)
+
+    if DEBUG:
+        print "Registering myself (instance id {}) with ELB {}...".format(
+                my_instance_id,
+                live_elb.name)
+
+    for attempt in range(ELB_CHANGE_ATTEMPTS):
+        try:
+            live_elb.register_instances(my_instance_id)
+            if DEBUG:
+                print("Registered with ELB!")
+            break
+        except BotoServerError as err:
+            if err.status == 400:
+                if attempt == (ELB_CHANGE_ATTEMPTS - 1):
+                    raise
+                time.sleep(1)
+
+    start = time.time()
+
+    timeout = time.time() + ELB_REGISTER_TIMEOUT
+    while time.time() < timeout:
+        try:
+            health = live_elb.get_instance_health([my_instance_id])[0]
+            assert health.instance_id == my_instance_id
+            if health.state == 'InService':
+                break
+        except BotoServerError as err:
+            if err.status != 400:
+                raise
+        time.sleep(3)
+
+    if DEBUG or health.state != 'InService':
+        print("Instance {} now successfully registered with ELB {} and {}"
+              "(took {:0.1f} seconds)".format(my_instance_id,
+                                              live_elb.name,
+                                              health.state,
+                                              time.time() - start))
+
+    if health.state == 'InService':
+        return True
+    else:
+        return False
+
+
+def get_cluster_name():
+    """
+    Gets 'Domain' and 'Role' (in AWS tag context) of current instance,
+    checking to be sure the domain is in the list of supported domains
+    for this script's function.
+
+    Returns:
+        (str, str)    Tuple of Domain and Role
+    """
+    current_domain = None
+    role = None
+    fqdn = socket.getfqdn()
+
+    for supported_domain in SUPPORTED_DOMAINS:
+        if fqdn.endswith(supported_domain):
+            current_domain = supported_domain
+
+    if current_domain is None:
+        raise NameError('This domain is not supported!')
+
+    hostname = fqdn.replace('.' + current_domain, '')
+    role = hostname.split('.')[-1]
+
+    assert (role is not None), "Couldn't determine Role!"
+
+    return (current_domain, role)
+
+
+def is_quorum_in_elb(quorum, live_elb, output=DEBUG):
+    """
+    Determines if minimum QUORUM instances are in state 'InService' with elb
+    live_elb and do *not* have description "Instance deregistration currently
+    in progress." Returns False if quorum not available, True if it is.
+    QUORUM is determined by (constant QUORUM fraction * total instances with
+    name ending with role from ELB name and with prclt.net domain).
+
+    Args:
+        quorum (float)      Fraction of instances that must be in service
+                            for quorum in ELB
+        live_elb (boto.ec2.elb.loadbalancer.LoadBalancer)   ELB to check
+        output (boolean)    If TRUE, print output during run for 'count' cmd
+
+    Returns:
+        Boolean             True if ELB has quorum, False if not
+    """
+    assert isinstance(live_elb, boto.ec2.elb.loadbalancer.LoadBalancer)
+    assert isinstance(quorum, float)
+    assert isinstance(output, bool)
+
+    # Figure out how many instances exist in cluster and how many are
+    # registered to the ELB in order to determine quorum total
+    domain, role = get_cluster_name()
+
+    filters = {'tag:Role': role,
+               'tag:Domain': domain,
+               'instance-state-name': "running"}
+
+    check_conn = boto.ec2.connect_to_region(profile_name=AWS_PROFILE,
+                                            region_name=AWS_REGION)
+
+    fleet = check_conn.get_only_instances(filters=filters)
+
+    instances_in_fleet = len(fleet)
+
+    assert (instances_in_fleet > 0), "Shouldn't be zero instances in fleet!"
+
+    instances_registered = len(live_elb.instances)
+
+    healthycount = 0
+
+    if output:
+        print("Total instances in cluster "
+              "for {}: {}".format(live_elb.name,
+                                  instances_in_fleet))
+        print("Total instances registered "
+              "in {}: {}".format(live_elb.name,
+                                 instances_registered))
+
+    for attempt in range(BOTO_ATTEMPTS):
+        try:
+            instance_health_list = live_elb.get_instance_health()
+            break
+        except BotoServerError as err:
+            if err.status == 400:
+                if attempt == (BOTO_ATTEMPTS - 1):
+                    raise
+                time.sleep(1)
+            else:
+                raise
+
+    for health in instance_health_list:
+        if output:
+            print("Instance {} has status {} and "
+                  "description {}".format(health.instance_id,
+                                          health.state,
+                                          health.description))
+        # If instance is draining, the description will be
+        # "Instance deregistration currently in progress"
+        if (health.state == 'InService') and ("deregistration" not in
+                                              health.description):
+            healthycount += 1
+
+    if output:
+        print("Fraction of instances in service: {:0.3f} ({:d} of {:d}) "
+              "in cluster for ELB {}".format(healthycount / instances_in_fleet,
+                                             healthycount,
+                                             instances_in_fleet,
+                                             live_elb.name))
+
+    if (healthycount >= MIN_INSTANCES and
+            (healthycount / instances_in_fleet) >= quorum):
+        if output:
+            print("# of instances in service meets quorum of {} "
+                  "and minimum count of {}.".format(quorum, MIN_INSTANCES))
+        return True
+    else:
+        return False
+
+
+def in_service(elb, instance_id):
+    """
+    Checks whether instance (instance_id) is 'InService' with elb (elb).
+
+    Args:
+        elb  (boto.ec2.elb.loadbalancer.LoadBalancer)     ELB to check
+        instance_id  (str)          Instance ID to determine state for
+
+    Returns:
+        Boolean                     True if instance_id registered with elb and
+                                    status is 'InService', False otherwise
+    """
+    assert isinstance(elb, boto.ec2.elb.loadbalancer.LoadBalancer)
+    assert isinstance(instance_id, str)
+
+    for attempt in range(BOTO_ATTEMPTS):
+        try:
+            health = elb.get_instance_health([instance_id])[0]
+            break
+        except BotoServerError as err:
+            if err.status == 400:
+                if attempt == (BOTO_ATTEMPTS - 1):
+                    raise
+                time.sleep(1)
+            else:
+                raise
+
+    assert health.instance_id == instance_id
+
+    if health.state == 'InService':
+        if DEBUG is True:
+            print("This instance is InService with ELB!")
+        return True
+    else:
+        if DEBUG is True:
+            print("This instance is {} with ELB!".format(health.state))
+        return False
+
+
+def perform_restart(service_name, my_instance_id, elb_name=None):
+    """
+    Performs full script function run - checks quorum, and if
+    available, deregisters from ELB, restarts passed supervisor
+    processes, then reregisters with ELB. Note that if not given,
+    service_name will be NONE (global default). If instance is
+    not in an ELB, will silently skip deregister and quorum
+    check steps. One exception: if there is a file or dir at
+    path NO_REGISTER_ELB, this function will do nothing and return
+    True, silently unless DEBUG is True.
+
+    Args:
+        service_name (str)      Name of supervisor process to restart, or
+                                'all' or 'NONE'
+        my_instance_id (str)    Instance ID of local instance
+        elb_name (str)          If given, the name of the ELB to register
+                                to after restart
+
+    Returns:
+        boolean                 True if successful, false on any error
+    """
+    assert isinstance(service_name, basestring)
+    assert isinstance(my_instance_id, str)
+    assert isinstance(elb_name, (basestring, type(None)))
+
+    deregister_elb = get_my_current_elb(my_instance_id)
+
+    if elb_name is None:
+        register_elb = get_elb_by_hostname()
+    else:
+        register_elb = get_elb_by_name(elb_name)
+
+    assert isinstance(register_elb, boto.ec2.elb.loadbalancer.LoadBalancer)
+
+    if deregister_elb is not None and in_service(deregister_elb,
+                                                 my_instance_id) is True:
+        for attempt in range(QUORUM_ATTEMPTS):
+            quorum = is_quorum_in_elb(INSTANCE_QUORUM,
+                                      deregister_elb)
+            if quorum:
+                if DEBUG:
+                    print "Quorum available!"
+                break
+            else:
+                if attempt == (QUORUM_ATTEMPTS - 1):
+                    print("Could not obtain quorum "
+                          "in {} attempts!".format(QUORUM_ATTEMPTS))
+                    return False
+                time.sleep(QUORUM_RETRY_INTERVAL)
+
+        if deregister_from_elb(my_instance_id) is False:
+            return False
+
+    if not service_name == "NONE":
+        if DEBUG:
+            print "Restarting services..."
+
+        restart_command_args = "restart " + service_name
+        command = ["/usr/bin/sudo",
+                   "/usr/bin/supervisorctl",
+                   restart_command_args]
+        if DEBUG:
+            print command
+        try:
+            result = check_output(command)
+        except CalledProcessError, err:
+            print("Supervisor restart failed with error {}! "
+                  "Output was: {}"
+                  "Aborting restart!".format(err.output, result))
+            return False
+        if DEBUG:
+            print "Result:", result
+
+    if register_to_elb(my_instance_id, register_elb.name) is False:
+        return False
+
+    return True
+
+
+def main():
+    args = docopt(__doc__)
+
+    try:
+        my_instance_id = boto.utils.get_instance_metadata(timeout=2,
+                                                          num_retries=1
+                                                          )['instance-id']
+    except KeyError, err:
+        print ("ERROR: Can't get instance ID. Is this an AWS node?"
+               "Error: {}".format(err))
+        sys.exit(1)
+
+    if args['--debug']:
+        global DEBUG
+        DEBUG = True
+
+    if DEBUG:
+        print "Instance ID is {}".format(my_instance_id)
+        print "FQDN is {}".format(socket.getfqdn())
+
+    if args['register']:
+        if register_to_elb(my_instance_id, args['<elb_name>']) is True:
+            print "Registration complete."
+        else:
+            print "Registration complete but Instance not InService!"
+            sys.exit(1)
+
+    if args['restart']:
+        elb_name = args['<elb_name>']
+        if args['<service_name>'] == "ALL":
+            SERVICE_NAME = "all"
+        elif args['<service_name>']:
+            SERVICE_NAME = args['<service_name>']
+        restart_result = perform_restart(SERVICE_NAME,
+                                         my_instance_id,
+                                         elb_name)
+        if restart_result is False:
+            print("Restart was not fully successful!")
+            sys.exit(1)
+
+    if args['count']:
+        live_elb = get_my_current_elb(my_instance_id)
+        if live_elb is None:
+            print "I don't appear to be registered to an ELB!"
+            sys.exit(1)
+        is_quorum_in_elb(INSTANCE_QUORUM,
+                         live_elb,
+                         output=True)
+
+    if args['deregister']:
+        if deregister_from_elb(my_instance_id) is True:
+            print "Deregistration complete."
+        else:
+            print "Deregistration failed!"
+            sys.exit(1)
+
+if __name__ == "__main__":
+    main()
