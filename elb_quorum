@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""restart_service_elb
+"""elb_quorum
 
 Gracefully restart supervisor processes on an instance by first checking
 for quorum in the load balancer, then (if quorum exists) unregistering from
@@ -18,11 +18,11 @@ If a file or dir exists at path NO_REGISTER_ELB_PATH, the 'restart' command
 will silently abort (and report why if --debug is given).
 
 Usage:
-    restart_service_elb restart [ -d ] <service_name> [ <elb_name> ]
-    restart_service_elb deregister [ -d ]
-    restart_service_elb register <elb_name> [-d]
-    restart_service_elb count [-d]
-    restart_service_elb [ -h | --help ]
+    eb_quorum restart [ -d ] <service_name> [ <elb_name> ]
+    eb_quorum deregister [ -d ]
+    eb_quorum register <elb_name> [-d]
+    eb_quorum count [-d]
+    eb_quorum [ -h | --help ]
 
 Options:
     restart             Restart supervisor process <service_name>, ALL or NONE.

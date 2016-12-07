@@ -1,4 +1,4 @@
-## restart_service_elb
+## elb_quorum
 
 This script is a purpose-built hack intended to allow for more controlled cluster restarts when operating under
 an AWS load balancer.  Essentially, it has each instance which needs to restart its services first check
@@ -24,4 +24,5 @@ It requires boto2, docopt, and various other python packages.  It was written fo
 Also note - there is a slight delay during the instance registration/deregistration, so it is normal for a
 cluster to drop slightly below the set quorum fraction as a few instances 'race' each other to deregister.
 
-NO WARRANTY IS IMPLIED OR OFFERED.  USE THIS CODE AT YOUR OWN RISK.  OSWALD ACTED ALONE.
+NO WARRANTY IS IMPLIED OR OFFERED.  USE THIS CODE AT YOUR OWN RISK.  OSWALD ACTED ALONE. I HAVE NOT GIVEN
+A PERFECT EXPLANATION OF THE FUNCTIONING HERE, READ THE CODE.
